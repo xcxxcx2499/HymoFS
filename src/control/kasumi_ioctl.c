@@ -611,6 +611,8 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		char *kbuf;
 		size_t buf_size, written = 0;
 		int n;
+		bool path_tsr = false;
+		bool xattr_path_tsr = false;
 
 		if (copy_from_user(&list_arg, arg, sizeof(list_arg)))
 			return -EFAULT;
@@ -641,11 +643,26 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		/* Path redirect */
 		if (kasumi_syscall_dispatcher_nr >= 0 &&
 		    kasumi_has_syscall_hook(__NR_openat))
+			path_tsr = true;
+#ifdef __NR_getxattr
+		if (kasumi_syscall_dispatcher_nr >= 0 &&
+		    kasumi_has_syscall_hook(__NR_getxattr))
+			xattr_path_tsr = true;
+#endif
+#ifdef __NR_listxattr
+		if (kasumi_syscall_dispatcher_nr >= 0 &&
+		    kasumi_has_syscall_hook(__NR_listxattr))
+			xattr_path_tsr = true;
+#endif
+		if (path_tsr)
 			n = scnprintf(kbuf + written, buf_size - written, "path: TSR\n");
 		else if (kasumi_getname_kprobe_registered)
 			n = scnprintf(kbuf + written, buf_size - written, "path: kprobe (getname_flags)\n");
 		else
 			n = scnprintf(kbuf + written, buf_size - written, "path: none\n");
+		written += n;
+		n = scnprintf(kbuf + written, buf_size - written, "xattr path: %s\n",
+			      xattr_path_tsr ? "TSR" : "none");
 		written += n;
 
 		/* VFS hooks */
@@ -1001,8 +1018,8 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		mutex_unlock(&kasumi_config_mutex);
 
 		if (parent_dir) {
-			kasumi_add_inject_rule(parent_dir);
 			kasumi_mark_dir_has_inject(parent_dir);
+			kasumi_add_inject_rule(parent_dir);
 		}
 		if (target && kasumi_kern_path &&
 		    kasumi_kern_path(target, LOOKUP_FOLLOW, &path) == 0) {
@@ -1035,6 +1052,7 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 
 	case KSM_IOC_HIDE_RULE: {
 		char *resolved_src = NULL;
+		char *parent_dir = NULL;
 		struct path path;
 		struct inode *target_inode = NULL;
 		struct inode *parent_inode = NULL;
@@ -1064,6 +1082,23 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		if (resolved_src) {
 			kfree(src);
 			src = resolved_src;
+		}
+		{
+			char *ls = strrchr(src, '/');
+
+			if (ls) {
+				if (ls == src)
+					parent_dir = kstrdup("/", GFP_KERNEL);
+				else {
+					size_t l = ls - src;
+
+					parent_dir = kmalloc(l + 1, GFP_KERNEL);
+					if (parent_dir) {
+						memcpy(parent_dir, src, l);
+						parent_dir[l] = '\0';
+					}
+				}
+			}
 		}
 
 		if (target_inode) {
@@ -1110,6 +1145,10 @@ static int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		}
 		kasumi_enabled = true;
 		mutex_unlock(&kasumi_config_mutex);
+		if (parent_dir) {
+			kasumi_mark_dir_has_inject(parent_dir);
+			kasumi_add_inject_rule(parent_dir);
+		}
 		break;
 	}
 

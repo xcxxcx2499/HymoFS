@@ -131,6 +131,7 @@ char *(*kasumi_dentry_path_raw)(const struct dentry *, char *, int);
 char *(*kasumi_d_path)(const struct path *, char *, int);
 struct dentry *(*kasumi_d_hash_and_lookup)(struct dentry *, const struct qstr *);
 void *kasumi_vfs_getxattr_addr;
+void (*kasumi_path_get_ptr)(const struct path *);
 void (*kasumi_path_put_ptr)(const struct path *);
 void (*kasumi_free_inode_nonrcu_ptr)(struct inode *);
 struct file *(*kasumi_filp_open)(const char *, int, umode_t);

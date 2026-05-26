@@ -140,12 +140,15 @@ static int kasumi_resolve_runtime_symbols(void)
 	}
 	kasumi_d_path = (void *)kasumi_lookup_name("d_path");
 	kasumi_d_hash_and_lookup = (void *)kasumi_lookup_name("d_hash_and_lookup");
+	kasumi_path_get_ptr = (void *)kasumi_lookup_name("path_get");
 	kasumi_path_put_ptr = (void *)kasumi_lookup_name("path_put");
 	kasumi_free_inode_nonrcu_ptr = (void *)kasumi_lookup_name("free_inode_nonrcu");
 	if (!kasumi_d_path)
 		pr_warn("Kasumi: d_path not found, path resolution in populate/merge/hide may fail\n");
 	if (!kasumi_d_hash_and_lookup)
 		pr_warn("Kasumi: d_hash_and_lookup not found, merge dedup and hide filter disabled\n");
+	if (!kasumi_path_get_ptr)
+		pr_warn("Kasumi: path_get not found, AT_FDCWD relative redirect disabled\n");
 	if (!kasumi_path_put_ptr) {
 		pr_err("Kasumi: FATAL - path_put not found\n");
 		return -ENOENT;

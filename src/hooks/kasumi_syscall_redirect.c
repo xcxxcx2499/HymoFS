@@ -22,6 +22,8 @@
 #include <linux/uaccess.h>
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/fs_struct.h>
+#include <linux/path.h>
 #include <linux/sched.h>
 #include <linux/stat.h>
 #include <linux/string.h>
@@ -84,6 +86,25 @@ kasumi_syscall_hook_fn orig_kernel_statfs64;
 #endif
 #ifdef __NR_fstatfs64
 kasumi_syscall_hook_fn orig_kernel_fstatfs64;
+#endif
+static kasumi_syscall_hook_fn orig_kernel_getdents64;
+#ifdef __NR_newfstatat
+static kasumi_syscall_hook_fn orig_kernel_newfstatat;
+#endif
+#ifdef __NR_faccessat
+static kasumi_syscall_hook_fn orig_kernel_faccessat;
+#endif
+#ifdef __NR_getxattr
+static kasumi_syscall_hook_fn orig_kernel_getxattr;
+#endif
+#ifdef __NR_lgetxattr
+static kasumi_syscall_hook_fn orig_kernel_lgetxattr;
+#endif
+#ifdef __NR_listxattr
+static kasumi_syscall_hook_fn orig_kernel_listxattr;
+#endif
+#ifdef __NR_llistxattr
+static kasumi_syscall_hook_fn orig_kernel_llistxattr;
 #endif
 
 static int patch_entry(int nr, kasumi_syscall_hook_fn fn)
@@ -389,6 +410,89 @@ static long h_write(const struct pt_regs *regs)
 
 /* ---- path redirect + mount proxy via TSR ------------------------------- */
 
+static void kasumi_set_path_arg1(const struct pt_regs *regs, unsigned long value)
+{
+#if defined(__aarch64__)
+	((struct pt_regs *)regs)->regs[1] = value;
+#elif defined(__x86_64__)
+	((struct pt_regs *)regs)->si = value;
+#endif
+}
+
+static void kasumi_set_path_arg0(const struct pt_regs *regs, unsigned long value)
+{
+#if defined(__aarch64__)
+	((struct pt_regs *)regs)->regs[0] = value;
+#elif defined(__x86_64__)
+	((struct pt_regs *)regs)->di = value;
+#endif
+}
+
+static long kasumi_copy_user_path_at(int dirfd, const char __user *u,
+				     char *path, size_t size)
+{
+	char *page;
+	char *dir;
+	struct file *file;
+	struct path pwd;
+	long len;
+	int written;
+
+	if (!u || !path || size == 0)
+		return -EINVAL;
+	len = strncpy_from_user(path, u, size);
+	if (len <= 0 || len >= size)
+		return len;
+	path[size - 1] = '\0';
+	if (path[0] == '/' || !kasumi_d_path)
+		return len;
+
+	page = (char *)__get_free_page(GFP_KERNEL);
+	if (!page)
+		return len;
+	if (dirfd == AT_FDCWD) {
+		if (!current->fs || !kasumi_path_get_ptr)
+			goto out_free;
+		spin_lock(&current->fs->lock);
+		pwd = current->fs->pwd;
+		kasumi_path_get(&pwd);
+		spin_unlock(&current->fs->lock);
+		dir = kasumi_d_path(&pwd, page, PAGE_SIZE);
+		if (!IS_ERR_OR_NULL(dir) && dir[0] == '/') {
+			char rel[KSM_MAX_LEN_PATHNAME];
+
+			strscpy(rel, path, sizeof(rel));
+			if (strcmp(dir, "/") == 0)
+				written = scnprintf(path, size, "/%s", rel);
+			else
+				written = scnprintf(path, size, "%s/%s", dir, rel);
+			if (written > 0 && written < size)
+				len = written;
+		}
+		kasumi_path_put(&pwd);
+		goto out_free;
+	}
+	file = fget(dirfd);
+	if (!file)
+		goto out_free;
+	dir = kasumi_d_path(&file->f_path, page, PAGE_SIZE);
+	if (!IS_ERR_OR_NULL(dir) && dir[0] == '/') {
+		char rel[KSM_MAX_LEN_PATHNAME];
+
+		strscpy(rel, path, sizeof(rel));
+		if (strcmp(dir, "/") == 0)
+			written = scnprintf(path, size, "/%s", rel);
+		else
+			written = scnprintf(path, size, "%s/%s", dir, rel);
+		if (written > 0 && written < size)
+			len = written;
+	}
+	fput(file);
+out_free:
+	free_page((unsigned long)page);
+	return len;
+}
+
 static long do_openat(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
 {
 	char path[KSM_MAX_LEN_PATHNAME];
@@ -396,15 +500,15 @@ static long do_openat(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
 	char *t;
 	char *target_path = NULL;
 	long ret;
+	int dirfd = (int)regs->regs[0];
 	bool raw_proc_proxy = false;
 	long tgid = (long)task_tgid_vnr(current);
 
 	if (atomic_long_read(&kasumi_ioctl_tgid) == tgid ||
 	    atomic_long_read(&kasumi_xattr_source_tgid) == tgid)
 		return orig(regs);
-	if (!u || copy_from_user(path, u, sizeof(path) - 1))
+	if (kasumi_copy_user_path_at(dirfd, u, path, sizeof(path)) <= 0)
 		return orig(regs);
-	path[sizeof(path) - 1] = '\0';
 
 	if (path[0] == '/' && kasumi_path_needs_proc_proxy(path)) {
 		raw_proc_proxy = true;
@@ -414,15 +518,14 @@ static long do_openat(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
 	}
 
 	if (path[0] == '/' && atomic_read(&kasumi_rule_count) > 0) {
-		t = kasumi_resolve_target(path);
+		t = kasumi_resolve_target_slow(path);
 		if (t) {
 			size_t l = strlen(t) + 1;
 			char __user *n;
 			if (l <= KASUMI_PATH_BUF) {
 				n = kasumi_userspace_stack_buffer(t, l);
 				if (n)
-					((unsigned long *)regs)[1] =
-						(unsigned long)n;
+					kasumi_set_path_arg1(regs, (unsigned long)n);
 			}
 			target_path = t;
 		}
@@ -432,7 +535,7 @@ static long do_openat(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
 		char __user *n = kasumi_userspace_stack_buffer(
 			KASUMI_HIDE_PATH, sizeof(KASUMI_HIDE_PATH));
 		if (n)
-			((unsigned long *)regs)[1] = (unsigned long)n;
+			kasumi_set_path_arg1(regs, (unsigned long)n);
 	}
 
 	ret = orig(regs);
@@ -510,25 +613,45 @@ static long h_statx(const struct pt_regs *regs)
 	int fake_mnt_id;
 	long path_len;
 	long ret;
-
-	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE) ||
-	    !kasumi_should_apply_hide_rules())
-		return orig_kernel_statx(regs);
+	int dirfd;
 
 #if defined(__aarch64__)
+	dirfd = (int)regs->regs[0];
 	filename_user = (const char __user *)(uintptr_t)regs->regs[1];
 	buf = (struct statx __user *)(uintptr_t)regs->regs[4];
 #else
+	dirfd = (int)regs->di;
 	filename_user = (const char __user *)(uintptr_t)regs->si;
 	buf = (struct statx __user *)(uintptr_t)regs->r8;
 #endif
 	if (!filename_user || !buf)
 		return orig_kernel_statx(regs);
 
-	path_len = strncpy_from_user(path, filename_user, sizeof(path));
+	path_len = kasumi_copy_user_path_at(dirfd, filename_user, path, sizeof(path));
 	if (path_len <= 0 || path_len >= sizeof(path))
 		return orig_kernel_statx(regs);
 	if (path[0] != '/')
+		return orig_kernel_statx(regs);
+	if (kasumi_should_hide(path))
+		return -ENOENT;
+	{
+		char *target = kasumi_resolve_target_slow(path);
+
+		if (target) {
+			size_t len = strlen(target) + 1;
+			char __user *n = NULL;
+
+			if (len <= KASUMI_PATH_BUF)
+				n = kasumi_userspace_stack_buffer(target, len);
+			kfree(target);
+			if (n) {
+				kasumi_set_path_arg1(regs, (unsigned long)n);
+			}
+		}
+	}
+
+	if (!(kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE) ||
+	    !kasumi_should_apply_hide_rules())
 		return orig_kernel_statx(regs);
 
 	ret = orig_kernel_statx(regs);
@@ -550,6 +673,166 @@ static long h_statx(const struct pt_regs *regs)
 	return ret;
 }
 #endif
+
+struct kasumi_linux_dirent64 {
+	u64 d_ino;
+	s64 d_off;
+	unsigned short d_reclen;
+	unsigned char d_type;
+	char d_name[];
+};
+
+static long h_getdents64(const struct pt_regs *regs)
+{
+	char *kbuf = NULL;
+	char *pathbuf = NULL;
+	char *dir_path;
+	unsigned int pos = 0, out = 0;
+	unsigned int max_name_off = offsetof(struct kasumi_linux_dirent64, d_name);
+	long ret;
+	int fd;
+	void __user *udirent;
+	struct file *file;
+
+#if defined(__aarch64__)
+	fd = (int)regs->regs[0];
+	udirent = (void __user *)(uintptr_t)regs->regs[1];
+#else
+	fd = (int)regs->di;
+	udirent = (void __user *)(uintptr_t)regs->si;
+#endif
+	ret = orig_kernel_getdents64(regs);
+	if (ret <= 0 || atomic_read(&kasumi_hide_count) == 0 || !udirent)
+		return ret;
+	if (ret > 256 * 1024)
+		return ret;
+
+	file = fget(fd);
+	if (!file)
+		return ret;
+	pathbuf = (char *)__get_free_page(GFP_KERNEL);
+	if (!pathbuf) {
+		fput(file);
+		return ret;
+	}
+	dir_path = kasumi_d_path ? kasumi_d_path(&file->f_path, pathbuf, PAGE_SIZE) : ERR_PTR(-ENOENT);
+	fput(file);
+	if (IS_ERR_OR_NULL(dir_path) || *dir_path != '/') {
+		free_page((unsigned long)pathbuf);
+		return ret;
+	}
+
+	kbuf = kmalloc(ret, GFP_KERNEL);
+	if (!kbuf) {
+		free_page((unsigned long)pathbuf);
+		return ret;
+	}
+	if (copy_from_user(kbuf, udirent, ret))
+		goto out;
+
+	while (pos < ret) {
+		struct kasumi_linux_dirent64 *d = (void *)(kbuf + pos);
+		unsigned short reclen = d->d_reclen;
+		bool hide = false;
+
+		if (reclen < max_name_off + 1 || pos + reclen > ret)
+			goto out;
+		if (!(d->d_name[0] == '.' &&
+		      (d->d_name[1] == '\0' ||
+		       (d->d_name[1] == '.' && d->d_name[2] == '\0')))) {
+			char *full;
+
+			if (strcmp(dir_path, "/") == 0)
+				full = kasprintf(GFP_KERNEL, "/%s", d->d_name);
+			else
+				full = kasprintf(GFP_KERNEL, "%s/%s", dir_path, d->d_name);
+			if (full) {
+				hide = kasumi_should_hide(full);
+				kfree(full);
+			}
+		}
+		if (hide) {
+			atomic64_inc(&kasumi_hook_stats.filldir_hidden);
+		} else {
+			if (out != pos)
+				memmove(kbuf + out, d, reclen);
+			out += reclen;
+		}
+		pos += reclen;
+	}
+	if (out != ret && !copy_to_user(udirent, kbuf, out))
+		ret = out;
+
+out:
+	kfree(kbuf);
+	free_page((unsigned long)pathbuf);
+	return ret;
+}
+
+static long do_path1_hide(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
+{
+	char path[KSM_MAX_LEN_PATHNAME];
+	const char __user *u;
+	char *target;
+	int dirfd;
+
+#if defined(__aarch64__)
+	dirfd = (int)regs->regs[0];
+	u = (const char __user *)(uintptr_t)regs->regs[1];
+#else
+	dirfd = (int)regs->di;
+	u = (const char __user *)(uintptr_t)regs->si;
+#endif
+	if (kasumi_copy_user_path_at(dirfd, u, path, sizeof(path)) <= 0)
+		return orig(regs);
+	if (path[0] == '/' && kasumi_should_hide(path))
+		return -ENOENT;
+	if (path[0] == '/') {
+		target = kasumi_resolve_target_slow(path);
+		if (target) {
+			size_t len = strlen(target) + 1;
+			char __user *n = NULL;
+
+			if (len <= KASUMI_PATH_BUF)
+				n = kasumi_userspace_stack_buffer(target, len);
+			kfree(target);
+			if (n)
+				kasumi_set_path_arg1(regs, (unsigned long)n);
+		}
+	}
+	return orig(regs);
+}
+
+static long do_path0_hide(const struct pt_regs *regs, kasumi_syscall_hook_fn orig)
+{
+	char path[KSM_MAX_LEN_PATHNAME];
+	const char __user *u;
+	char *target;
+
+#if defined(__aarch64__)
+	u = (const char __user *)(uintptr_t)regs->regs[0];
+#else
+	u = (const char __user *)(uintptr_t)regs->di;
+#endif
+	if (kasumi_copy_user_path_at(AT_FDCWD, u, path, sizeof(path)) <= 0)
+		return orig(regs);
+	if (path[0] == '/' && kasumi_should_hide(path))
+		return -ENOENT;
+	if (path[0] == '/') {
+		target = kasumi_resolve_target_slow(path);
+		if (target) {
+			size_t len = strlen(target) + 1;
+			char __user *n = NULL;
+
+			if (len <= KASUMI_PATH_BUF)
+				n = kasumi_userspace_stack_buffer(target, len);
+			kfree(target);
+			if (n)
+				kasumi_set_path_arg0(regs, (unsigned long)n);
+		}
+	}
+	return orig(regs);
+}
 
 static long __nocfi d_openat(const struct pt_regs *r)
 {
@@ -575,6 +858,89 @@ static long __nocfi d_fstatfs(const struct pt_regs *r)
 static long __nocfi d_statx(const struct pt_regs *r)
 {
 	return kasumi_call_direct(h_statx, r);
+}
+#endif
+
+static long __nocfi d_getdents64(const struct pt_regs *r)
+{
+	return kasumi_call_direct(h_getdents64, r);
+}
+
+#ifdef __NR_newfstatat
+static long __nocfi d_newfstatat(const struct pt_regs *r)
+{
+	long ret;
+	int idx;
+
+	idx = srcu_read_lock(&kasumi_redirect_srcu);
+	ret = do_path1_hide(r, orig_kernel_newfstatat);
+	srcu_read_unlock(&kasumi_redirect_srcu, idx);
+	return ret;
+}
+#endif
+
+#ifdef __NR_faccessat
+static long __nocfi d_faccessat(const struct pt_regs *r)
+{
+	long ret;
+	int idx;
+
+	idx = srcu_read_lock(&kasumi_redirect_srcu);
+	ret = do_path1_hide(r, orig_kernel_faccessat);
+	srcu_read_unlock(&kasumi_redirect_srcu, idx);
+	return ret;
+}
+#endif
+
+#ifdef __NR_getxattr
+static long __nocfi d_getxattr(const struct pt_regs *r)
+{
+	long ret;
+	int idx;
+
+	idx = srcu_read_lock(&kasumi_redirect_srcu);
+	ret = do_path0_hide(r, orig_kernel_getxattr);
+	srcu_read_unlock(&kasumi_redirect_srcu, idx);
+	return ret;
+}
+#endif
+
+#ifdef __NR_lgetxattr
+static long __nocfi d_lgetxattr(const struct pt_regs *r)
+{
+	long ret;
+	int idx;
+
+	idx = srcu_read_lock(&kasumi_redirect_srcu);
+	ret = do_path0_hide(r, orig_kernel_lgetxattr);
+	srcu_read_unlock(&kasumi_redirect_srcu, idx);
+	return ret;
+}
+#endif
+
+#ifdef __NR_listxattr
+static long __nocfi d_listxattr(const struct pt_regs *r)
+{
+	long ret;
+	int idx;
+
+	idx = srcu_read_lock(&kasumi_redirect_srcu);
+	ret = do_path0_hide(r, orig_kernel_listxattr);
+	srcu_read_unlock(&kasumi_redirect_srcu, idx);
+	return ret;
+}
+#endif
+
+#ifdef __NR_llistxattr
+static long __nocfi d_llistxattr(const struct pt_regs *r)
+{
+	long ret;
+	int idx;
+
+	idx = srcu_read_lock(&kasumi_redirect_srcu);
+	ret = do_path0_hide(r, orig_kernel_llistxattr);
+	srcu_read_unlock(&kasumi_redirect_srcu, idx);
+	return ret;
 }
 #endif
 
@@ -677,6 +1043,32 @@ int kasumi_syscall_redirect_init(void)
 	orig_kernel_write = ((kasumi_syscall_hook_fn *)
 		kasumi_syscall_table)[__NR_write];
 #endif
+	orig_kernel_getdents64 = ((kasumi_syscall_hook_fn *)
+		kasumi_syscall_table)[__NR_getdents64];
+#ifdef __NR_newfstatat
+	orig_kernel_newfstatat = ((kasumi_syscall_hook_fn *)
+		kasumi_syscall_table)[__NR_newfstatat];
+#endif
+#ifdef __NR_faccessat
+	orig_kernel_faccessat = ((kasumi_syscall_hook_fn *)
+		kasumi_syscall_table)[__NR_faccessat];
+#endif
+#ifdef __NR_getxattr
+	orig_kernel_getxattr = ((kasumi_syscall_hook_fn *)
+		kasumi_syscall_table)[__NR_getxattr];
+#endif
+#ifdef __NR_lgetxattr
+	orig_kernel_lgetxattr = ((kasumi_syscall_hook_fn *)
+		kasumi_syscall_table)[__NR_lgetxattr];
+#endif
+#ifdef __NR_listxattr
+	orig_kernel_listxattr = ((kasumi_syscall_hook_fn *)
+		kasumi_syscall_table)[__NR_listxattr];
+#endif
+#ifdef __NR_llistxattr
+	orig_kernel_llistxattr = ((kasumi_syscall_hook_fn *)
+		kasumi_syscall_table)[__NR_llistxattr];
+#endif
 
 {
 	int n = 0;
@@ -698,6 +1090,25 @@ int kasumi_syscall_redirect_init(void)
 #if defined(__aarch64__) || defined(__x86_64__)
 	kasumi_add_syscall_hook_counted(__NR_read,    d_read, &n);
 	kasumi_add_syscall_hook_counted(__NR_write,   d_write, &n);
+#endif
+	kasumi_add_syscall_hook_counted(__NR_getdents64, d_getdents64, &n);
+#ifdef __NR_newfstatat
+	kasumi_add_syscall_hook_counted(__NR_newfstatat, d_newfstatat, &n);
+#endif
+#ifdef __NR_faccessat
+	kasumi_add_syscall_hook_counted(__NR_faccessat, d_faccessat, &n);
+#endif
+#ifdef __NR_getxattr
+	kasumi_add_syscall_hook_counted(__NR_getxattr, d_getxattr, &n);
+#endif
+#ifdef __NR_lgetxattr
+	kasumi_add_syscall_hook_counted(__NR_lgetxattr, d_lgetxattr, &n);
+#endif
+#ifdef __NR_listxattr
+	kasumi_add_syscall_hook_counted(__NR_listxattr, d_listxattr, &n);
+#endif
+#ifdef __NR_llistxattr
+	kasumi_add_syscall_hook_counted(__NR_llistxattr, d_llistxattr, &n);
 #endif
 	ret = kasumi_patch_registered_syscalls();
 	if (ret) {
@@ -810,6 +1221,25 @@ void kasumi_syscall_redirect_exit(void)
 	orig_kernel_fstatfs = NULL;
 #ifdef __NR_statx
 	orig_kernel_statx   = NULL;
+#endif
+	orig_kernel_getdents64 = NULL;
+#ifdef __NR_newfstatat
+	orig_kernel_newfstatat = NULL;
+#endif
+#ifdef __NR_faccessat
+	orig_kernel_faccessat = NULL;
+#endif
+#ifdef __NR_getxattr
+	orig_kernel_getxattr = NULL;
+#endif
+#ifdef __NR_lgetxattr
+	orig_kernel_lgetxattr = NULL;
+#endif
+#ifdef __NR_listxattr
+	orig_kernel_listxattr = NULL;
+#endif
+#ifdef __NR_llistxattr
+	orig_kernel_llistxattr = NULL;
 #endif
 #ifdef __NR_statfs64
 	orig_kernel_statfs64 = NULL;

@@ -75,9 +75,7 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 	struct kasumi_filldir_wrapper *w =
 		container_of(ctx, struct kasumi_filldir_wrapper, wrap_ctx);
 	KASUMI_FILLDIR_RET_TYPE ret;
-
-	if (!kasumi_should_apply_hide_rules())
-		goto passthrough;
+	bool apply_hide = kasumi_should_apply_hide_rules();
 
 	/* Inject phase: before first real entry, emit entries from merge targets
 	 * and kasumi_paths into the directory listing. */
@@ -117,7 +115,7 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 			goto passthrough;
 	}
 
-	if (kasumi_stealth_enabled && w->dir_path_len == 4) {
+	if (apply_hide && kasumi_stealth_enabled && w->dir_path_len == 4) {
 		size_t mlen = strlen(kasumi_current_mirror_name);
 		if ((unsigned int)namlen == mlen &&
 		    memcmp(name, kasumi_current_mirror_name, namlen) == 0)
@@ -129,9 +127,9 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 	 * replaces the original, just like original kasumi.c does.
 	 * Skip when merge target IS the dir we're listing (e.g. target path
 	 * resolved to same inode via symlink) - otherwise we'd hide everything.
-	 * Must respect allowlist: privileged/allowlist processes see real files. */
-	if (kasumi_d_hash_and_lookup && w->merge_target_count > 0 && w->parent_dentry &&
-	    !kasumi_is_privileged_process() && kasumi_should_apply_hide_rules()) {
+	 * This is independent of app-hide policy because explicit merge rules
+	 * must not emit duplicate names even during root/manual validation. */
+	if (kasumi_d_hash_and_lookup && w->merge_target_count > 0 && w->parent_dentry) {
 		int i;
 		for (i = 0; i < w->merge_target_count; i++) {
 			struct dentry *tgt = w->merge_target_dentries[i];
@@ -151,8 +149,7 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 		}
 	}
 
-	if (kasumi_d_hash_and_lookup && w->dir_has_hidden && w->parent_dentry &&
-	    !kasumi_is_privileged_process() && kasumi_should_apply_hide_rules()) {
+	if (kasumi_d_hash_and_lookup && w->dir_has_hidden && w->parent_dentry) {
 		struct dentry *child;
 
 		child = kasumi_d_hash_and_lookup(w->parent_dentry,
@@ -1299,8 +1296,6 @@ struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struct file *file,
 		return NULL;
 	if (!READ_ONCE(kasumi_enabled))
 		return NULL;
-	if (uid_eq(current_uid(), GLOBAL_ROOT_UID))
-		return NULL;
 	if (READ_ONCE(kasumi_daemon_pid) > 0 && task_tgid_vnr(current) == READ_ONCE(kasumi_daemon_pid))
 		return NULL;
 	if (!orig_ctx || !orig_ctx->actor)
@@ -1316,6 +1311,7 @@ struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struct file *file,
 	w->wrap_ctx.actor = kasumi_filldir_filter;
 	w->wrap_ctx.pos = orig_ctx->pos;
 	w->parent_dentry = file && file->f_path.dentry ? file->f_path.dentry : NULL;
+	w->inject_done = orig_ctx->pos != 0;
 
 	if (w->parent_dentry) {
 		dir_inode = d_inode(w->parent_dentry);
@@ -1383,6 +1379,12 @@ struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struct file *file,
 				rcu_read_unlock();
 			}
 		}
+	}
+
+	if (uid_eq(current_uid(), GLOBAL_ROOT_UID) &&
+	    !w->dir_has_hidden && !w->dir_has_inject) {
+		kmem_cache_free(kasumi_filldir_cache, w);
+		return NULL;
 	}
 
 	if (!w->dir_has_hidden && !w->dir_has_inject &&

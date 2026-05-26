@@ -371,8 +371,12 @@ char *kasumi_resolve_target(const char *pathname)
 	pid = task_tgid_vnr(current);
 	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
 		return NULL;
-	if (!kasumi_should_apply_hide_rules())
-		return NULL;
+	/*
+	 * ADD_RULE is an explicit path translation contract, not an app hide
+	 * policy decision. Keep it independent from kasumi_should_apply_hide_rules()
+	 * so root/manual tests and userspace-controlled redirects still work when
+	 * the hide allowlist has not selected the current UID.
+	 */
 
 	path_len = strlen(pathname);
 	hash = full_name_hash(NULL, pathname, path_len);
@@ -414,6 +418,70 @@ char *kasumi_resolve_target(const char *pathname)
 	return target;
 }
 
+char *kasumi_resolve_target_slow(const char *pathname)
+{
+	struct kasumi_merge_entry *me;
+	char *src = NULL;
+	char *target_dir = NULL;
+	char *target = NULL;
+	size_t path_len;
+	int bkt;
+	pid_t pid;
+
+	target = kasumi_resolve_target(pathname);
+	if (target)
+		return target;
+
+	if (unlikely(!kasumi_enabled || !pathname || !*pathname))
+		return NULL;
+	pid = task_tgid_vnr(current);
+	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
+		return NULL;
+	if (!kasumi_kern_path)
+		return NULL;
+
+	path_len = strlen(pathname);
+	rcu_read_lock();
+	hash_for_each_rcu(kasumi_merge_dirs, bkt, me, node) {
+		size_t src_len;
+
+		if (!me->src || !me->target)
+			continue;
+		src_len = strlen(me->src);
+		if (path_len <= src_len || pathname[src_len] != '/')
+			continue;
+		if (strncmp(pathname, me->src, src_len) != 0)
+			continue;
+		src = kstrdup(me->src, GFP_ATOMIC);
+		target_dir = kstrdup(me->target, GFP_ATOMIC);
+		break;
+	}
+	rcu_read_unlock();
+
+	if (src && target_dir) {
+		struct path p;
+		const char *suffix = pathname + strlen(src);
+
+		target = kasprintf(GFP_KERNEL, "%s%s", target_dir, suffix);
+		if (target && kasumi_kern_path(target, LOOKUP_FOLLOW, &p) == 0) {
+			if (p.dentry && d_inode(p.dentry) &&
+			    S_ISDIR(d_inode(p.dentry)->i_mode)) {
+				kasumi_path_put(&p);
+				kfree(target);
+				target = NULL;
+			} else {
+				kasumi_path_put(&p);
+			}
+		} else {
+			kfree(target);
+			target = NULL;
+		}
+	}
+	kfree(src);
+	kfree(target_dir);
+	return target;
+}
+
 struct kasumi_entry *kasumi_reverse_lookup_target(const char *path_str)
 {
 	struct kasumi_entry *entry;
@@ -435,35 +503,18 @@ struct kasumi_entry *kasumi_reverse_lookup_target(const char *path_str)
  * Part 14: Hide Logic
  * ====================================================================== */
 
-bool kasumi_should_hide(const char *pathname)
+static bool kasumi_hide_rule_matches(const char *pathname)
 {
 	struct kasumi_hide_entry *he;
 	u32 hash;
 	size_t len;
 
-	if (unlikely(!kasumi_enabled || !pathname || !*pathname))
+	if (!pathname || !*pathname)
 		return false;
-	if (unlikely(kasumi_is_privileged_process()))
-		return false;
-	if (!kasumi_should_apply_hide_rules())
-		return false;
-
-	len = strlen(pathname);
-
-	/* Stealth: always hide the mirror device */
-	if (likely(kasumi_stealth_enabled)) {
-		size_t name_len = strlen(kasumi_current_mirror_name);
-		size_t path_len = strlen(kasumi_current_mirror_path);
-
-		if ((len == name_len && strcmp(pathname, kasumi_current_mirror_name) == 0) ||
-		    (len == path_len && strcmp(pathname, kasumi_current_mirror_path) == 0))
-			return true;
-	}
-
-	/* Bloom fast-path */
 	if (atomic_read(&kasumi_hide_count) == 0)
 		return false;
 
+	len = strlen(pathname);
 	{
 		unsigned long bh1 = jhash(pathname, (u32)len, 0) & (KASUMI_BLOOM_SIZE - 1);
 		unsigned long bh2 = jhash(pathname, (u32)len, 1) & (KASUMI_BLOOM_SIZE - 1);
@@ -482,6 +533,38 @@ bool kasumi_should_hide(const char *pathname)
 		}
 	}
 	rcu_read_unlock();
+	return false;
+}
+
+bool kasumi_should_hide(const char *pathname)
+{
+	size_t len;
+	pid_t pid;
+
+	if (unlikely(!kasumi_enabled || !pathname || !*pathname))
+		return false;
+	pid = task_tgid_vnr(current);
+	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
+		return false;
+	if (kasumi_hide_rule_matches(pathname))
+		return true;
+	if (unlikely(kasumi_is_privileged_process()))
+		return false;
+	if (!kasumi_should_apply_hide_rules())
+		return false;
+
+	len = strlen(pathname);
+
+	/* Stealth: always hide the mirror device */
+	if (likely(kasumi_stealth_enabled)) {
+		size_t name_len = strlen(kasumi_current_mirror_name);
+		size_t path_len = strlen(kasumi_current_mirror_path);
+
+		if ((len == name_len && strcmp(pathname, kasumi_current_mirror_name) == 0) ||
+		    (len == path_len && strcmp(pathname, kasumi_current_mirror_path) == 0))
+			return true;
+	}
+
 	return false;
 }
 

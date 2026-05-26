@@ -154,6 +154,7 @@ extern char *(*kasumi_dentry_path_raw)(const struct dentry *, char *, int);
 extern char *(*kasumi_d_path)(const struct path *, char *, int);
 extern struct dentry *(*kasumi_d_hash_and_lookup)(struct dentry *, const struct qstr *);
 extern void *kasumi_vfs_getxattr_addr;
+extern void (*kasumi_path_get_ptr)(const struct path *);
 extern void (*kasumi_path_put_ptr)(const struct path *);
 extern void (*kasumi_free_inode_nonrcu_ptr)(struct inode *);
 extern struct file *(*kasumi_filp_open)(const char *, int, umode_t);
@@ -173,6 +174,12 @@ static inline void kasumi_path_put(const struct path *path)
 {
 	if (kasumi_path_put_ptr)
 		kasumi_path_put_ptr(path);
+}
+
+static inline void kasumi_path_get(const struct path *path)
+{
+	if (kasumi_path_get_ptr)
+		kasumi_path_get_ptr(path);
 }
 
 #endif /* _KASUMI_RUNTIME_H */
